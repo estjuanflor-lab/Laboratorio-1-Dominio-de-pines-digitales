@@ -1,0 +1,3254 @@
+#include <Arduino.h>
+#include <LiquidCrystal.h>
+#include <Keypad.h>
+#include <Preferences.h>
+#include <math.h>
+
+// ============================================================
+// PRACTICA: DOMINIO DE PINES DIGITALES
+// ESP32 + 28BYJ-48 + ULN2003 + LCD1602 + TECLADO 4x4
+// + SENSOR OPTICO GPIO 34 + DISCO ENCODER
+//
+// FUNCIONES:
+// - HOME automatico al encender
+// - Posicion angular absoluta 0 a 360 grados
+// - Velocidad seleccionable de 1 a 10
+// - LCD con posicion y velocidad en tiempo real
+// - Cambio de angulo sin reiniciar
+// - Cambio de velocidad sin reiniciar
+// - Parada manual
+// - Calibracion almacenada en memoria
+//
+// TECLAS:
+// D = ingresar angulo
+// B = ingresar velocidad
+// C = detener motor
+// A = cancelar / salir de menus
+// * = borrar entrada completa
+// C dentro de menu = borrar ultima cifra
+// # = confirmar
+// ============================================================
+
+
+// ============================================================
+// PINES DEFINITIVOS
+// ============================================================
+
+// ULN2003
+const byte MOTOR_PINS[4] = {
+  18, 19, 21, 22
+};
+
+// Sensor optico
+const byte PIN_SENSOR = 34;
+
+// LCD:
+// RS, E, D4, D5, D6, D7
+LiquidCrystal lcd(
+  13,
+  14,
+  25,
+  26,
+  27,
+  32
+);
+
+
+// ============================================================
+// TECLADO 4x4
+// ============================================================
+
+const byte FILAS = 4;
+const byte COLUMNAS = 4;
+
+char MAPA_TECLAS[FILAS][COLUMNAS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+byte PINES_FILAS[FILAS] = {
+  16, 17, 33, 4
+};
+
+byte PINES_COLUMNAS[COLUMNAS] = {
+  5, 12, 15, 2
+};
+
+Keypad teclado = Keypad(
+  makeKeymap(MAPA_TECLAS),
+  PINES_FILAS,
+  PINES_COLUMNAS,
+  FILAS,
+  COLUMNAS
+);
+
+
+// ============================================================
+// MEMORIA ESP32
+// ============================================================
+
+Preferences memoria;
+
+
+// ============================================================
+// MOTOR
+// ============================================================
+
+// El movimiento positivo debe coincidir
+// fisicamente con el sentido horario.
+const int DIRECCION_HORARIA = 1;
+
+const int DIRECCION_HOME =
+  DIRECCION_HORARIA;
+
+
+// Secuencia de medio paso
+const byte SECUENCIA_MEDIO_PASO[8][4] = {
+
+  {1, 0, 0, 0},
+  {1, 1, 0, 0},
+  {0, 1, 0, 0},
+  {0, 1, 1, 0},
+  {0, 0, 1, 0},
+  {0, 0, 1, 1},
+  {0, 0, 0, 1},
+  {1, 0, 0, 1}
+
+};
+
+int indiceSecuencia = 0;
+
+
+// ============================================================
+// VELOCIDADES 1 - 10
+// ============================================================
+//
+// Menor tiempo entre pasos = mayor velocidad
+//
+
+const uint16_t INTERVALO_VELOCIDAD_US[10] = {
+
+  3600,   // Velocidad 1
+  3300,   // Velocidad 2
+  3000,   // Velocidad 3
+  2700,   // Velocidad 4
+  2400,   // Velocidad 5
+  2100,   // Velocidad 6
+  1850,   // Velocidad 7
+  1600,   // Velocidad 8
+  1400,   // Velocidad 9
+  1200    // Velocidad 10
+
+};
+
+int nivelVelocidad = 5;
+
+uint16_t intervaloActualUs = 3600;
+
+uint32_t ultimoPasoUs = 0;
+
+
+// ============================================================
+// VELOCIDADES PARA HOME Y CALIBRACION
+// ============================================================
+
+const uint16_t VEL_ESCANEO_US = 1800;
+const uint16_t VEL_RETORNO_US = 2300;
+const uint16_t VEL_PRECISA_US = 3200;
+
+
+// ============================================================
+// CONFIGURACION DEL DISCO ENCODER
+// ============================================================
+
+const long PASOS_ESCANEO = 4700;
+
+const long LIMITE_HOME = 5500;
+
+const int MAX_ABERTURAS = 50;
+
+const int RETROCESO_ADICIONAL = 30;
+
+
+// ============================================================
+// DATOS DE CALIBRACION
+// ============================================================
+
+int nivelAbertura = HIGH;
+
+int anchoNormal = 0;
+
+int anchoEspecial = 0;
+
+int umbralEspecial = 0;
+
+long pasosPorVuelta = 4096;
+
+
+// ============================================================
+// POSICION
+// ============================================================
+
+long posicionActualPasos = 0;
+
+long posicionObjetivoPasos = 0;
+
+int anguloObjetivo = 0;
+
+bool movimientoEnCurso = false;
+
+bool sistemaListo = false;
+
+
+// ============================================================
+// DATOS TEMPORALES DEL ENCODER
+// ============================================================
+
+long inicioAberturas[MAX_ABERTURAS];
+
+int anchoAberturas[MAX_ABERTURAS];
+
+int cantidadAberturas = 0;
+
+
+// ============================================================
+// INTERFAZ
+// ============================================================
+
+enum ModoInterfaz {
+
+  MODO_PRINCIPAL,
+
+  MODO_ANGULO,
+
+  MODO_VELOCIDAD
+
+};
+
+ModoInterfaz modoInterfaz =
+  MODO_PRINCIPAL;
+
+String entradaUsuario = "";
+
+
+// ============================================================
+// CONTROL DE LCD
+// ============================================================
+
+char ultimaLinea1[17] = "";
+
+char ultimaLinea2[17] = "";
+
+bool mensajeTemporalActivo = false;
+
+unsigned long finMensajeTemporalMs = 0;
+
+char mensajeTemporal1[17] = "";
+
+char mensajeTemporal2[17] = "";
+
+unsigned long ultimaActualizacionLCD = 0;
+
+const unsigned long PERIODO_LCD_MS = 100;
+
+
+// ============================================================
+// UTILIDADES LCD
+// ============================================================
+
+void copiarTexto16(
+  char *destino,
+  const char *origen
+) {
+
+  strncpy(
+    destino,
+    origen,
+    16
+  );
+
+  destino[16] = '\0';
+
+}
+
+
+// ------------------------------------------------------------
+
+void escribirLineaLCD(
+  byte fila,
+  const char *texto
+) {
+
+  char linea[17];
+
+  snprintf(
+    linea,
+    sizeof(linea),
+    "%-16.16s",
+    texto
+  );
+
+
+  char *ultima =
+    (fila == 0)
+    ? ultimaLinea1
+    : ultimaLinea2;
+
+
+  if (
+    strncmp(
+      linea,
+      ultima,
+      16
+    ) == 0
+  ) {
+
+    return;
+
+  }
+
+
+  lcd.setCursor(
+    0,
+    fila
+  );
+
+  lcd.print(linea);
+
+
+  copiarTexto16(
+    ultima,
+    linea
+  );
+
+}
+
+
+// ------------------------------------------------------------
+
+void forzarRedibujadoLCD() {
+
+  ultimaLinea1[0] = '\0';
+
+  ultimaLinea2[0] = '\0';
+
+}
+
+
+// ------------------------------------------------------------
+
+void mostrarDirecto(
+  const char *linea1,
+  const char *linea2
+) {
+
+  escribirLineaLCD(
+    0,
+    linea1
+  );
+
+  escribirLineaLCD(
+    1,
+    linea2
+  );
+
+}
+
+
+// ------------------------------------------------------------
+
+void activarMensajeTemporal(
+  const char *linea1,
+  const char *linea2,
+  unsigned long duracionMs
+) {
+
+  copiarTexto16(
+    mensajeTemporal1,
+    linea1
+  );
+
+  copiarTexto16(
+    mensajeTemporal2,
+    linea2
+  );
+
+
+  mensajeTemporalActivo = true;
+
+
+  finMensajeTemporalMs =
+    millis() + duracionMs;
+
+
+  forzarRedibujadoLCD();
+
+}
+
+
+// ============================================================
+// CONTROL DEL MOTOR
+// ============================================================
+
+void activarPaso(int indice) {
+
+  for (
+    int i = 0;
+    i < 4;
+    i++
+  ) {
+
+    digitalWrite(
+      MOTOR_PINS[i],
+      SECUENCIA_MEDIO_PASO[indice][i]
+    );
+
+  }
+
+}
+
+
+// ------------------------------------------------------------
+
+void moverUnPasoFisico(
+  int direccion
+) {
+
+  indiceSecuencia += direccion;
+
+
+  if (
+    indiceSecuencia > 7
+  ) {
+
+    indiceSecuencia = 0;
+
+  }
+
+  else if (
+    indiceSecuencia < 0
+  ) {
+
+    indiceSecuencia = 7;
+
+  }
+
+
+  activarPaso(
+    indiceSecuencia
+  );
+
+}
+
+
+// ------------------------------------------------------------
+
+void moverUnPasoBloqueante(
+  int direccion,
+  uint16_t intervaloUs
+) {
+
+  moverUnPasoFisico(
+    direccion
+  );
+
+
+  delayMicroseconds(
+    intervaloUs
+  );
+
+}
+
+
+// ------------------------------------------------------------
+
+void moverPasosBloqueante(
+  long cantidad,
+  int direccion,
+  uint16_t intervaloUs
+) {
+
+  for (
+    long i = 0;
+    i < cantidad;
+    i++
+  ) {
+
+    moverUnPasoBloqueante(
+      direccion,
+      intervaloUs
+    );
+
+  }
+
+}
+
+
+// ------------------------------------------------------------
+
+void liberarMotor() {
+
+  for (
+    int i = 0;
+    i < 4;
+    i++
+  ) {
+
+    digitalWrite(
+      MOTOR_PINS[i],
+      LOW
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// NORMALIZACION DE POSICION
+// ============================================================
+
+long normalizarPasos(
+  long pasos
+) {
+
+  if (
+    pasosPorVuelta <= 0
+  ) {
+
+    return 0;
+
+  }
+
+
+  pasos %=
+    pasosPorVuelta;
+
+
+  if (
+    pasos < 0
+  ) {
+
+    pasos +=
+      pasosPorVuelta;
+
+  }
+
+
+  return pasos;
+
+}
+
+
+// ------------------------------------------------------------
+
+long diferenciaMasCorta(
+  long objetivo,
+  long actual
+) {
+
+  long diferencia =
+    objetivo - actual;
+
+
+  if (
+    diferencia >
+    pasosPorVuelta / 2
+  ) {
+
+    diferencia -=
+      pasosPorVuelta;
+
+  }
+
+
+  if (
+    diferencia <
+    -(pasosPorVuelta / 2)
+  ) {
+
+    diferencia +=
+      pasosPorVuelta;
+
+  }
+
+
+  return diferencia;
+
+}
+
+
+// ============================================================
+// CONVERSION PASOS <-> GRADOS
+// ============================================================
+
+int pasosAGrados(
+  long pasos
+) {
+
+  if (
+    pasosPorVuelta <= 0
+  ) {
+
+    return 0;
+
+  }
+
+
+  long normalizados =
+    normalizarPasos(
+      pasos
+    );
+
+
+  int grados =
+    lround(
+
+      (double)normalizados
+      * 360.0
+      /
+      (double)pasosPorVuelta
+
+    );
+
+
+  if (
+    grados >= 360
+  ) {
+
+    grados = 0;
+
+  }
+
+
+  return grados;
+
+}
+
+
+// ------------------------------------------------------------
+
+long gradosAPasos(
+  int grados
+) {
+
+  if (
+    grados == 360
+  ) {
+
+    grados = 0;
+
+  }
+
+
+  long pasos =
+    lround(
+
+      (double)grados
+      *
+      (double)pasosPorVuelta
+      /
+      360.0
+
+    );
+
+
+  return normalizarPasos(
+    pasos
+  );
+
+}
+
+
+// ============================================================
+// SENSOR
+// ============================================================
+
+int leerSensorEstable() {
+
+  int altos = 0;
+
+  int bajos = 0;
+
+
+  for (
+    int i = 0;
+    i < 7;
+    i++
+  ) {
+
+    if (
+      digitalRead(
+        PIN_SENSOR
+      ) == HIGH
+    ) {
+
+      altos++;
+
+    }
+
+    else {
+
+      bajos++;
+
+    }
+
+
+    delayMicroseconds(
+      100
+    );
+
+  }
+
+
+  return (
+    altos > bajos
+  )
+  ? HIGH
+  : LOW;
+
+}
+
+
+// ------------------------------------------------------------
+
+bool hayAbertura() {
+
+  return
+    leerSensorEstable()
+    ==
+    nivelAbertura;
+
+}
+
+
+// ============================================================
+// MEMORIA
+// ============================================================
+
+void guardarCalibracion() {
+
+  memoria.putBool(
+    "ok",
+    true
+  );
+
+
+  memoria.putInt(
+    "nivel",
+    nivelAbertura
+  );
+
+
+  memoria.putInt(
+    "normal",
+    anchoNormal
+  );
+
+
+  memoria.putInt(
+    "especial",
+    anchoEspecial
+  );
+
+
+  memoria.putLong(
+    "ppv",
+    pasosPorVuelta
+  );
+
+}
+
+
+// ------------------------------------------------------------
+
+bool cargarCalibracion() {
+
+  if (
+    !memoria.getBool(
+      "ok",
+      false
+    )
+  ) {
+
+    return false;
+
+  }
+
+
+  nivelAbertura =
+    memoria.getInt(
+      "nivel",
+      HIGH
+    );
+
+
+  anchoNormal =
+    memoria.getInt(
+      "normal",
+      0
+    );
+
+
+  anchoEspecial =
+    memoria.getInt(
+      "especial",
+      0
+    );
+
+
+  pasosPorVuelta =
+    memoria.getLong(
+      "ppv",
+      0
+    );
+
+
+  if (
+
+    anchoNormal <= 0 ||
+
+    anchoEspecial <=
+    anchoNormal ||
+
+    pasosPorVuelta < 3000 ||
+
+    pasosPorVuelta > 5000
+
+  ) {
+
+    return false;
+
+  }
+
+
+  umbralEspecial =
+    (
+      anchoNormal
+      +
+      anchoEspecial
+    )
+    /
+    2;
+
+
+  int velocidadGuardada =
+    memoria.getInt(
+      "vel",
+      5
+    );
+
+
+  if (
+
+    velocidadGuardada >= 1 &&
+
+    velocidadGuardada <= 10
+
+  ) {
+
+    nivelVelocidad =
+      velocidadGuardada;
+
+  }
+
+
+  return true;
+
+}
+
+
+// ------------------------------------------------------------
+
+void guardarEstadoOperacion() {
+
+  memoria.putInt(
+    "vel",
+    nivelVelocidad
+  );
+
+
+  memoria.putInt(
+    "lastpos",
+    pasosAGrados(
+      posicionActualPasos
+    )
+  );
+
+}
+
+
+// ============================================================
+// CALIBRACION
+// ============================================================
+
+bool salirDeAberturaActual(
+  int limite = 1200
+) {
+
+  int pasos = 0;
+
+
+  while (
+
+    hayAbertura() &&
+
+    pasos < limite
+
+  ) {
+
+    moverUnPasoBloqueante(
+      DIRECCION_HOME,
+      VEL_ESCANEO_US
+    );
+
+
+    pasos++;
+
+  }
+
+
+  return
+    !hayAbertura();
+
+}
+
+
+// ------------------------------------------------------------
+
+void guardarAbertura(
+  long inicio,
+  int ancho
+) {
+
+  if (
+
+    cantidadAberturas >=
+    MAX_ABERTURAS ||
+
+    ancho < 3
+
+  ) {
+
+    return;
+
+  }
+
+
+  inicioAberturas[
+    cantidadAberturas
+  ] = inicio;
+
+
+  anchoAberturas[
+    cantidadAberturas
+  ] = ancho;
+
+
+  cantidadAberturas++;
+
+}
+
+
+// ------------------------------------------------------------
+
+int obtenerMedianaAberturas() {
+
+  int copia[
+    MAX_ABERTURAS
+  ];
+
+
+  for (
+    int i = 0;
+    i < cantidadAberturas;
+    i++
+  ) {
+
+    copia[i] =
+      anchoAberturas[i];
+
+  }
+
+
+  for (
+    int i = 1;
+    i < cantidadAberturas;
+    i++
+  ) {
+
+    int valor =
+      copia[i];
+
+
+    int j =
+      i - 1;
+
+
+    while (
+
+      j >= 0 &&
+
+      copia[j] > valor
+
+    ) {
+
+      copia[j + 1] =
+        copia[j];
+
+
+      j--;
+
+    }
+
+
+    copia[j + 1] =
+      valor;
+
+  }
+
+
+  return
+    copia[
+      cantidadAberturas / 2
+    ];
+
+}
+
+
+// ============================================================
+// POSICIONAMIENTO PRECISO HOME
+// ============================================================
+
+bool posicionarEnPrimerBorde() {
+
+  int seguridad = 0;
+
+
+  while (
+
+    !hayAbertura() &&
+
+    seguridad < 900
+
+  ) {
+
+    moverUnPasoBloqueante(
+
+      -DIRECCION_HOME,
+
+      VEL_RETORNO_US
+
+    );
+
+
+    seguridad++;
+
+  }
+
+
+  if (
+    !hayAbertura()
+  ) {
+
+    return false;
+
+  }
+
+
+  seguridad = 0;
+
+
+  while (
+
+    hayAbertura() &&
+
+    seguridad < 1200
+
+  ) {
+
+    moverUnPasoBloqueante(
+
+      -DIRECCION_HOME,
+
+      VEL_RETORNO_US
+
+    );
+
+
+    seguridad++;
+
+  }
+
+
+  if (
+    hayAbertura()
+  ) {
+
+    return false;
+
+  }
+
+
+  // Alejarse ligeramente
+  for (
+    int i = 0;
+    i < 25;
+    i++
+  ) {
+
+    moverUnPasoBloqueante(
+
+      -DIRECCION_HOME,
+
+      VEL_RETORNO_US
+
+    );
+
+  }
+
+
+  delay(
+    250
+  );
+
+
+  seguridad = 0;
+
+
+  // Aproximacion lenta
+  while (
+
+    !hayAbertura() &&
+
+    seguridad < 900
+
+  ) {
+
+    moverUnPasoBloqueante(
+
+      DIRECCION_HOME,
+
+      VEL_PRECISA_US
+
+    );
+
+
+    seguridad++;
+
+  }
+
+
+  if (
+    !hayAbertura()
+  ) {
+
+    return false;
+
+  }
+
+
+  liberarMotor();
+
+
+  posicionActualPasos = 0;
+
+  posicionObjetivoPasos = 0;
+
+  anguloObjetivo = 0;
+
+
+  return true;
+
+}
+
+
+// ============================================================
+// ESCANEAR DISCO
+// ============================================================
+
+bool escanearDisco(
+  int &indiceEspecial
+) {
+
+  cantidadAberturas = 0;
+
+
+  bool dentroAbertura = false;
+
+  long inicioActual = 0;
+
+
+  mostrarDirecto(
+    "Escaneando disco",
+    "Espere..."
+  );
+
+
+  for (
+
+    long paso = 1;
+
+    paso <= PASOS_ESCANEO;
+
+    paso++
+
+  ) {
+
+    moverUnPasoBloqueante(
+
+      DIRECCION_HOME,
+
+      VEL_ESCANEO_US
+
+    );
+
+
+    bool estadoActual =
+      hayAbertura();
+
+
+    if (
+
+      estadoActual &&
+
+      !dentroAbertura
+
+    ) {
+
+      dentroAbertura = true;
+
+      inicioActual = paso;
+
+    }
+
+
+    if (
+
+      !estadoActual &&
+
+      dentroAbertura
+
+    ) {
+
+      dentroAbertura = false;
+
+
+      guardarAbertura(
+
+        inicioActual,
+
+        paso -
+        inicioActual
+
+      );
+
+    }
+
+  }
+
+
+  if (
+    cantidadAberturas < 5
+  ) {
+
+    return false;
+
+  }
+
+
+  anchoNormal =
+    obtenerMedianaAberturas();
+
+
+  int anchoMayor = 0;
+
+  int segundoMayor = 0;
+
+  indiceEspecial = -1;
+
+
+  for (
+    int i = 0;
+    i < cantidadAberturas;
+    i++
+  ) {
+
+    int ancho =
+      anchoAberturas[i];
+
+
+    if (
+      ancho >= anchoMayor
+    ) {
+
+      segundoMayor =
+        anchoMayor;
+
+
+      anchoMayor =
+        ancho;
+
+
+      indiceEspecial =
+        i;
+
+    }
+
+    else if (
+      ancho > segundoMayor
+    ) {
+
+      segundoMayor =
+        ancho;
+
+    }
+
+  }
+
+
+  anchoEspecial =
+    anchoMayor;
+
+
+  bool diferenciaProporcional =
+
+    anchoEspecial * 10
+
+    >=
+
+    segundoMayor * 14;
+
+
+  bool diferenciaAbsoluta =
+
+    anchoEspecial
+
+    >=
+
+    segundoMayor + 15;
+
+
+  if (
+
+    indiceEspecial < 0 ||
+
+    !diferenciaProporcional ||
+
+    !diferenciaAbsoluta
+
+  ) {
+
+    return false;
+
+  }
+
+
+  umbralEspecial =
+
+    (
+      anchoNormal
+      +
+      anchoEspecial
+    )
+    /
+    2;
+
+
+  return true;
+
+}
+
+
+// ============================================================
+// REGRESAR A LA ABERTURA ESPECIAL
+// ============================================================
+
+bool regresarAlIndiceEscaneado(
+  int indiceEspecial
+) {
+
+  long inicioEspecial =
+
+    inicioAberturas[
+      indiceEspecial
+    ];
+
+
+  long pasosRegreso =
+
+    PASOS_ESCANEO
+
+    -
+
+    inicioEspecial
+
+    +
+
+    RETROCESO_ADICIONAL;
+
+
+  if (
+    pasosRegreso <= 0
+  ) {
+
+    return false;
+
+  }
+
+
+  moverPasosBloqueante(
+
+    pasosRegreso,
+
+    -DIRECCION_HOME,
+
+    VEL_RETORNO_US
+
+  );
+
+
+  int seguridad = 0;
+
+
+  while (
+
+    hayAbertura() &&
+
+    seguridad < 700
+
+  ) {
+
+    moverUnPasoBloqueante(
+
+      -DIRECCION_HOME,
+
+      VEL_RETORNO_US
+
+    );
+
+
+    seguridad++;
+
+  }
+
+
+  if (
+    hayAbertura()
+  ) {
+
+    return false;
+
+  }
+
+
+  seguridad = 0;
+
+
+  while (
+
+    !hayAbertura() &&
+
+    seguridad < 900
+
+  ) {
+
+    moverUnPasoBloqueante(
+
+      DIRECCION_HOME,
+
+      VEL_PRECISA_US
+
+    );
+
+
+    seguridad++;
+
+  }
+
+
+  if (
+    !hayAbertura()
+  ) {
+
+    return false;
+
+  }
+
+
+  liberarMotor();
+
+
+  posicionActualPasos = 0;
+
+  posicionObjetivoPasos = 0;
+
+  anguloObjetivo = 0;
+
+
+  return true;
+
+}
+
+
+// ============================================================
+// MEDIR PASOS REALES POR VUELTA
+// ============================================================
+
+bool medirPasosReales() {
+
+  long pasosContados = 0;
+
+
+  mostrarDirecto(
+    "Midiendo vuelta",
+    "Espere..."
+  );
+
+
+  // Salir de la abertura especial
+  while (
+
+    hayAbertura() &&
+
+    pasosContados < 1200
+
+  ) {
+
+    moverUnPasoBloqueante(
+
+      DIRECCION_HOME,
+
+      VEL_ESCANEO_US
+
+    );
+
+
+    pasosContados++;
+
+  }
+
+
+  if (
+    hayAbertura()
+  ) {
+
+    return false;
+
+  }
+
+
+  while (
+    pasosContados <
+    LIMITE_HOME
+  ) {
+
+
+    while (
+
+      !hayAbertura() &&
+
+      pasosContados <
+      LIMITE_HOME
+
+    ) {
+
+      moverUnPasoBloqueante(
+
+        DIRECCION_HOME,
+
+        VEL_ESCANEO_US
+
+      );
+
+
+      pasosContados++;
+
+    }
+
+
+    if (
+      pasosContados >=
+      LIMITE_HOME
+    ) {
+
+      break;
+
+    }
+
+
+    long entradaAbertura =
+      pasosContados;
+
+
+    int anchoActual = 0;
+
+
+    while (
+
+      hayAbertura() &&
+
+      pasosContados <
+      LIMITE_HOME
+
+    ) {
+
+      moverUnPasoBloqueante(
+
+        DIRECCION_HOME,
+
+        VEL_ESCANEO_US
+
+      );
+
+
+      pasosContados++;
+
+      anchoActual++;
+
+    }
+
+
+    if (
+
+      entradaAbertura > 1000 &&
+
+      anchoActual >=
+      umbralEspecial
+
+    ) {
+
+      pasosPorVuelta =
+        entradaAbertura;
+
+
+      if (
+        !posicionarEnPrimerBorde()
+      ) {
+
+        return false;
+
+      }
+
+
+      return true;
+
+    }
+
+  }
+
+
+  return false;
+
+}
+
+
+// ============================================================
+// CALIBRACION COMPLETA
+// ============================================================
+
+bool calibracionInicialCompleta() {
+
+  liberarMotor();
+
+
+  mostrarDirecto(
+
+    "Ponga indice 0",
+
+    "y pulse #"
+
+  );
+
+
+  // Colocar manualmente la abertura especial
+  // sobre el sensor y pulsar #
+
+  while (true) {
+
+    char tecla =
+      teclado.getKey();
+
+
+    if (
+      tecla == '#'
+    ) {
+
+      break;
+
+    }
+
+
+    delay(5);
+
+  }
+
+
+  nivelAbertura =
+    leerSensorEstable();
+
+
+  mostrarDirecto(
+
+    "Calibrando...",
+
+    "No desconectar"
+
+  );
+
+
+  if (
+    !salirDeAberturaActual()
+  ) {
+
+    liberarMotor();
+
+    return false;
+
+  }
+
+
+  int indiceEspecial = -1;
+
+
+  if (
+    !escanearDisco(
+      indiceEspecial
+    )
+  ) {
+
+    liberarMotor();
+
+    return false;
+
+  }
+
+
+  if (
+    !regresarAlIndiceEscaneado(
+      indiceEspecial
+    )
+  ) {
+
+    liberarMotor();
+
+    return false;
+
+  }
+
+
+  if (
+    !medirPasosReales()
+  ) {
+
+    liberarMotor();
+
+    return false;
+
+  }
+
+
+  guardarCalibracion();
+
+
+  posicionActualPasos = 0;
+
+  posicionObjetivoPasos = 0;
+
+  anguloObjetivo = 0;
+
+
+  return true;
+
+}
+
+
+// ============================================================
+// HOME AUTOMATICO
+// ============================================================
+
+bool buscarHomeAutomatico() {
+
+  liberarMotor();
+
+
+  mostrarDirecto(
+
+    "Buscando HOME",
+
+    "Espere..."
+
+  );
+
+
+  // Si arranca dentro de cualquier ventana,
+  // primero sale de ella.
+
+  if (
+
+    hayAbertura() &&
+
+    !salirDeAberturaActual()
+
+  ) {
+
+    liberarMotor();
+
+    return false;
+
+  }
+
+
+  long pasosTotales = 0;
+
+
+  while (
+    pasosTotales <
+    LIMITE_HOME
+  ) {
+
+
+    // Buscar siguiente abertura
+    while (
+
+      !hayAbertura() &&
+
+      pasosTotales <
+      LIMITE_HOME
+
+    ) {
+
+      moverUnPasoBloqueante(
+
+        DIRECCION_HOME,
+
+        VEL_ESCANEO_US
+
+      );
+
+
+      pasosTotales++;
+
+    }
+
+
+    if (
+      pasosTotales >=
+      LIMITE_HOME
+    ) {
+
+      break;
+
+    }
+
+
+    int anchoActual = 0;
+
+
+    // Medir abertura encontrada
+    while (
+
+      hayAbertura() &&
+
+      pasosTotales <
+      LIMITE_HOME
+
+    ) {
+
+      moverUnPasoBloqueante(
+
+        DIRECCION_HOME,
+
+        VEL_ESCANEO_US
+
+      );
+
+
+      anchoActual++;
+
+      pasosTotales++;
+
+    }
+
+
+    // ¿Es la abertura especial?
+    if (
+      anchoActual >=
+      umbralEspecial
+    ) {
+
+
+      if (
+        !posicionarEnPrimerBorde()
+      ) {
+
+        liberarMotor();
+
+        return false;
+
+      }
+
+
+      posicionActualPasos = 0;
+
+      posicionObjetivoPasos = 0;
+
+      anguloObjetivo = 0;
+
+
+      liberarMotor();
+
+
+      return true;
+
+    }
+
+  }
+
+
+  liberarMotor();
+
+
+  return false;
+
+}
+
+
+// ============================================================
+// MOVIMIENTO NORMAL
+// ============================================================
+
+void iniciarMovimientoAAngulo(
+  int grados
+) {
+
+  if (
+    grados == 360
+  ) {
+
+    grados = 0;
+
+  }
+
+
+  anguloObjetivo =
+    grados;
+
+
+  posicionObjetivoPasos =
+    gradosAPasos(
+      grados
+    );
+
+
+  movimientoEnCurso =
+
+    (
+      diferenciaMasCorta(
+
+        posicionObjetivoPasos,
+
+        posicionActualPasos
+
+      )
+
+      != 0
+    );
+
+
+  intervaloActualUs = 3600;
+
+  ultimoPasoUs =
+    micros();
+
+
+  if (
+    !movimientoEnCurso
+  ) {
+
+    liberarMotor();
+
+
+    activarMensajeTemporal(
+
+      "Ya esta en",
+
+      "esa posicion",
+
+      900
+
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// DETENER MOTOR
+// ============================================================
+
+void detenerMotorEnPosicionActual() {
+
+  posicionObjetivoPasos =
+    posicionActualPasos;
+
+
+  anguloObjetivo =
+    pasosAGrados(
+      posicionActualPasos
+    );
+
+
+  movimientoEnCurso = false;
+
+
+  liberarMotor();
+
+
+  guardarEstadoOperacion();
+
+
+  activarMensajeTemporal(
+
+    "Motor detenido",
+
+    "Posicion guardada",
+
+    1000
+
+  );
+
+}
+
+
+// ============================================================
+// MOVIMIENTO NO BLOQUEANTE
+// ============================================================
+
+void actualizarMotorNoBloqueante() {
+
+  if (
+    !movimientoEnCurso
+  ) {
+
+    return;
+
+  }
+
+
+  long diferencia =
+
+    diferenciaMasCorta(
+
+      posicionObjetivoPasos,
+
+      posicionActualPasos
+
+    );
+
+
+  // Llegó al destino
+  if (
+    diferencia == 0
+  ) {
+
+    movimientoEnCurso = false;
+
+
+    liberarMotor();
+
+
+    guardarEstadoOperacion();
+
+
+    char linea2[17];
+
+
+    snprintf(
+
+      linea2,
+
+      sizeof(linea2),
+
+      "%d grados",
+
+      anguloObjetivo
+
+    );
+
+
+    activarMensajeTemporal(
+
+      "Posicion lista",
+
+      linea2,
+
+      900
+
+    );
+
+
+    return;
+
+  }
+
+
+  long pasosRestantes =
+    labs(
+      diferencia
+    );
+
+
+  uint16_t intervaloDeseado =
+
+    INTERVALO_VELOCIDAD_US[
+      nivelVelocidad - 1
+    ];
+
+
+  // Frenado progresivo
+  if (
+    pasosRestantes < 100
+  ) {
+
+    uint16_t intervaloFrenado =
+
+      intervaloDeseado
+
+      +
+
+      (uint16_t)(
+        (100 - pasosRestantes)
+        * 20
+      );
+
+
+    if (
+      intervaloFrenado > 3600
+    ) {
+
+      intervaloFrenado = 3600;
+
+    }
+
+
+    if (
+      intervaloFrenado >
+      intervaloDeseado
+    ) {
+
+      intervaloDeseado =
+        intervaloFrenado;
+
+    }
+
+  }
+
+
+  // Aceleración progresiva
+  if (
+    intervaloActualUs >
+    intervaloDeseado
+  ) {
+
+    uint16_t diferenciaIntervalo =
+
+      intervaloActualUs
+
+      -
+
+      intervaloDeseado;
+
+
+    intervaloActualUs -=
+
+      (
+        diferenciaIntervalo > 20
+      )
+
+      ? 20
+
+      : diferenciaIntervalo;
+
+  }
+
+  else if (
+    intervaloActualUs <
+    intervaloDeseado
+  ) {
+
+    uint16_t diferenciaIntervalo =
+
+      intervaloDeseado
+
+      -
+
+      intervaloActualUs;
+
+
+    intervaloActualUs +=
+
+      (
+        diferenciaIntervalo > 20
+      )
+
+      ? 20
+
+      : diferenciaIntervalo;
+
+  }
+
+
+  uint32_t ahoraUs =
+    micros();
+
+
+  if (
+
+    (uint32_t)(
+      ahoraUs -
+      ultimoPasoUs
+    )
+
+    <
+
+    intervaloActualUs
+
+  ) {
+
+    return;
+
+  }
+
+
+  ultimoPasoUs =
+    ahoraUs;
+
+
+  int signoLogico =
+
+    (
+      diferencia > 0
+    )
+
+    ? 1
+    : -1;
+
+
+  int direccionFisica =
+
+    signoLogico
+
+    *
+
+    DIRECCION_HORARIA;
+
+
+  moverUnPasoFisico(
+    direccionFisica
+  );
+
+
+  posicionActualPasos =
+
+    normalizarPasos(
+
+      posicionActualPasos
+
+      +
+
+      signoLogico
+
+    );
+
+}
+
+
+// ============================================================
+// PANTALLA PRINCIPAL
+// ============================================================
+
+void dibujarPantallaPrincipal() {
+
+  char linea1[17];
+
+  char linea2[17];
+
+
+  int anguloActual =
+
+    pasosAGrados(
+      posicionActualPasos
+    );
+
+
+  snprintf(
+
+    linea1,
+
+    sizeof(linea1),
+
+    "POS:%3d%c V:%02d",
+
+    anguloActual,
+
+    (char)223,
+
+    nivelVelocidad
+
+  );
+
+
+  if (
+    movimientoEnCurso
+  ) {
+
+    snprintf(
+
+      linea2,
+
+      sizeof(linea2),
+
+      "DEST:%3d%c MOV",
+
+      anguloObjetivo,
+
+      (char)223
+
+    );
+
+  }
+
+  else {
+
+    snprintf(
+
+      linea2,
+
+      sizeof(linea2),
+
+      "D:ANG B:VEL"
+
+    );
+
+  }
+
+
+  escribirLineaLCD(
+    0,
+    linea1
+  );
+
+
+  escribirLineaLCD(
+    1,
+    linea2
+  );
+
+}
+
+
+// ============================================================
+// MENU ANGULO
+// ============================================================
+
+void dibujarPantallaEntradaAngulo() {
+
+  char linea2[17];
+
+
+  escribirLineaLCD(
+
+    0,
+
+    "ANGULO 0-360"
+
+  );
+
+
+  if (
+    entradaUsuario.length() == 0
+  ) {
+
+    snprintf(
+
+      linea2,
+
+      sizeof(linea2),
+
+      ">--- #OK A:SAL"
+
+    );
+
+  }
+
+  else {
+
+    snprintf(
+
+      linea2,
+
+      sizeof(linea2),
+
+      ">%s%c #OK",
+
+      entradaUsuario.c_str(),
+
+      (char)223
+
+    );
+
+  }
+
+
+  escribirLineaLCD(
+    1,
+    linea2
+  );
+
+}
+
+
+// ============================================================
+// MENU VELOCIDAD
+// ============================================================
+
+void dibujarPantallaEntradaVelocidad() {
+
+  char linea2[17];
+
+
+  escribirLineaLCD(
+
+    0,
+
+    "VELOCIDAD 1-10"
+
+  );
+
+
+  if (
+    entradaUsuario.length() == 0
+  ) {
+
+    snprintf(
+
+      linea2,
+
+      sizeof(linea2),
+
+      ">-- #OK A:SAL"
+
+    );
+
+  }
+
+  else {
+
+    snprintf(
+
+      linea2,
+
+      sizeof(linea2),
+
+      ">%s/10 #OK",
+
+      entradaUsuario.c_str()
+
+    );
+
+  }
+
+
+  escribirLineaLCD(
+    1,
+    linea2
+  );
+
+}
+
+
+// ============================================================
+// ACTUALIZAR LCD
+// ============================================================
+
+void actualizarLCDOperacion() {
+
+  unsigned long ahora =
+    millis();
+
+
+  if (
+
+    (unsigned long)(
+      ahora -
+      ultimaActualizacionLCD
+    )
+
+    <
+
+    PERIODO_LCD_MS
+
+  ) {
+
+    return;
+
+  }
+
+
+  ultimaActualizacionLCD =
+    ahora;
+
+
+  // Mensajes temporales
+  if (
+    mensajeTemporalActivo
+  ) {
+
+    if (
+
+      (long)(
+        ahora -
+        finMensajeTemporalMs
+      )
+
+      < 0
+
+    ) {
+
+      escribirLineaLCD(
+        0,
+        mensajeTemporal1
+      );
+
+
+      escribirLineaLCD(
+        1,
+        mensajeTemporal2
+      );
+
+
+      return;
+
+    }
+
+
+    mensajeTemporalActivo =
+      false;
+
+
+    forzarRedibujadoLCD();
+
+  }
+
+
+  switch (
+    modoInterfaz
+  ) {
+
+
+    case MODO_ANGULO:
+
+      dibujarPantallaEntradaAngulo();
+
+      break;
+
+
+    case MODO_VELOCIDAD:
+
+      dibujarPantallaEntradaVelocidad();
+
+      break;
+
+
+    case MODO_PRINCIPAL:
+
+    default:
+
+      dibujarPantallaPrincipal();
+
+      break;
+
+  }
+
+}
+
+
+// ============================================================
+// VOLVER A PANTALLA PRINCIPAL
+// ============================================================
+
+void volverPantallaPrincipal() {
+
+  modoInterfaz =
+    MODO_PRINCIPAL;
+
+
+  entradaUsuario = "";
+
+
+  forzarRedibujadoLCD();
+
+}
+
+
+// ============================================================
+// CONFIRMAR ANGULO
+// ============================================================
+
+void confirmarAngulo() {
+
+  if (
+    entradaUsuario.length() == 0
+  ) {
+
+    activarMensajeTemporal(
+
+      "Ingrese angulo",
+
+      "antes de #",
+
+      900
+
+    );
+
+
+    return;
+
+  }
+
+
+  int valor =
+    entradaUsuario.toInt();
+
+
+  if (
+
+    valor < 0 ||
+
+    valor > 360
+
+  ) {
+
+    activarMensajeTemporal(
+
+      "Angulo invalido",
+
+      "Rango 0-360",
+
+      1200
+
+    );
+
+
+    entradaUsuario = "";
+
+
+    return;
+
+  }
+
+
+  volverPantallaPrincipal();
+
+
+  iniciarMovimientoAAngulo(
+    valor
+  );
+
+}
+
+
+// ============================================================
+// CONFIRMAR VELOCIDAD
+// ============================================================
+
+void confirmarVelocidad() {
+
+  if (
+    entradaUsuario.length() == 0
+  ) {
+
+    activarMensajeTemporal(
+
+      "Ingrese nivel",
+
+      "entre 1 y 10",
+
+      900
+
+    );
+
+
+    return;
+
+  }
+
+
+  int valor =
+    entradaUsuario.toInt();
+
+
+  if (
+
+    valor < 1 ||
+
+    valor > 10
+
+  ) {
+
+    activarMensajeTemporal(
+
+      "Vel. invalida",
+
+      "Rango 1-10",
+
+      1200
+
+    );
+
+
+    entradaUsuario = "";
+
+
+    return;
+
+  }
+
+
+  nivelVelocidad =
+    valor;
+
+
+  memoria.putInt(
+
+    "vel",
+
+    nivelVelocidad
+
+  );
+
+
+  char linea2[17];
+
+
+  snprintf(
+
+    linea2,
+
+    sizeof(linea2),
+
+    "Nivel %d de 10",
+
+    nivelVelocidad
+
+  );
+
+
+  volverPantallaPrincipal();
+
+
+  activarMensajeTemporal(
+
+    "Velocidad lista",
+
+    linea2,
+
+    900
+
+  );
+
+}
+
+
+// ============================================================
+// PROCESAR TECLADO
+// ============================================================
+
+void procesarTecla(
+  char tecla
+) {
+
+  if (
+    tecla == NO_KEY
+  ) {
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // PANTALLA PRINCIPAL
+  // ==========================================================
+
+  if (
+    modoInterfaz ==
+    MODO_PRINCIPAL
+  ) {
+
+
+    // D = ingresar angulo
+    if (
+      tecla == 'D'
+    ) {
+
+      entradaUsuario = "";
+
+      modoInterfaz =
+        MODO_ANGULO;
+
+
+      forzarRedibujadoLCD();
+
+
+      return;
+
+    }
+
+
+    // B = velocidad
+    if (
+      tecla == 'B'
+    ) {
+
+      entradaUsuario = "";
+
+      modoInterfaz =
+        MODO_VELOCIDAD;
+
+
+      forzarRedibujadoLCD();
+
+
+      return;
+
+    }
+
+
+    // C = detener motor
+    if (
+      tecla == 'C'
+    ) {
+
+      detenerMotorEnPosicionActual();
+
+
+      return;
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // DENTRO DE LOS MENUS
+  // ==========================================================
+
+
+  // A = salir / cancelar
+  if (
+    tecla == 'A'
+  ) {
+
+    volverPantallaPrincipal();
+
+
+    return;
+
+  }
+
+
+  // * = borrar toda la entrada
+  if (
+    tecla == '*'
+  ) {
+
+    entradaUsuario = "";
+
+
+    forzarRedibujadoLCD();
+
+
+    return;
+
+  }
+
+
+  // C = borrar última cifra
+  if (
+    tecla == 'C'
+  ) {
+
+    if (
+      entradaUsuario.length() > 0
+    ) {
+
+      entradaUsuario.remove(
+
+        entradaUsuario.length() - 1
+
+      );
+
+    }
+
+
+    forzarRedibujadoLCD();
+
+
+    return;
+
+  }
+
+
+  // Números
+  if (
+
+    tecla >= '0' &&
+
+    tecla <= '9'
+
+  ) {
+
+    byte maximoCaracteres =
+
+      (
+        modoInterfaz ==
+        MODO_ANGULO
+      )
+
+      ? 3
+
+      : 2;
+
+
+    if (
+
+      entradaUsuario.length()
+
+      <
+
+      maximoCaracteres
+
+    ) {
+
+      entradaUsuario +=
+        tecla;
+
+
+      forzarRedibujadoLCD();
+
+    }
+
+
+    return;
+
+  }
+
+
+  // # = confirmar
+  if (
+    tecla == '#'
+  ) {
+
+
+    if (
+      modoInterfaz ==
+      MODO_ANGULO
+    ) {
+
+      confirmarAngulo();
+
+    }
+
+
+    else if (
+      modoInterfaz ==
+      MODO_VELOCIDAD
+    ) {
+
+      confirmarVelocidad();
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(
+    115200
+  );
+
+
+  delay(
+    1000
+  );
+
+
+  // Motor
+  for (
+    int i = 0;
+    i < 4;
+    i++
+  ) {
+
+    pinMode(
+      MOTOR_PINS[i],
+      OUTPUT
+    );
+
+  }
+
+
+  // Sensor
+  pinMode(
+    PIN_SENSOR,
+    INPUT
+  );
+
+
+  liberarMotor();
+
+
+  // LCD
+  lcd.begin(
+    16,
+    2
+  );
+
+
+  // Teclado
+  teclado.setDebounceTime(
+    50
+  );
+
+
+  teclado.setHoldTime(
+    500
+  );
+
+
+  // Memoria
+  memoria.begin(
+    "encmotor",
+    false
+  );
+
+
+  mostrarDirecto(
+
+    "SISTEMA ANGULAR",
+
+    "Iniciando..."
+
+  );
+
+
+  delay(
+    1000
+  );
+
+
+  // ==========================================================
+  // CARGAR CALIBRACION
+  // ==========================================================
+
+  bool calibracionDisponible =
+    cargarCalibracion();
+
+
+  bool inicioCorrecto =
+    false;
+
+
+  if (
+    !calibracionDisponible
+  ) {
+
+    // Primera vez:
+    // calibración completa
+
+    inicioCorrecto =
+      calibracionInicialCompleta();
+
+  }
+
+  else {
+
+    // Encendido normal:
+    // buscar HOME automáticamente
+
+    inicioCorrecto =
+      buscarHomeAutomatico();
+
+  }
+
+
+  // ==========================================================
+  // SI HOME FALLA
+  // ==========================================================
+
+  while (
+    !inicioCorrecto
+  ) {
+
+    liberarMotor();
+
+
+    mostrarDirecto(
+
+      "ERROR DE HOME",
+
+      "#:REINT A:CAL"
+
+    );
+
+
+    char tecla =
+      teclado.getKey();
+
+
+    // Reintentar
+    if (
+      tecla == '#'
+    ) {
+
+
+      if (
+        cargarCalibracion()
+      ) {
+
+        inicioCorrecto =
+          buscarHomeAutomatico();
+
+      }
+
+      else {
+
+        inicioCorrecto =
+          calibracionInicialCompleta();
+
+      }
+
+    }
+
+
+    // A = recalibrar completamente
+    else if (
+      tecla == 'A'
+    ) {
+
+      inicioCorrecto =
+        calibracionInicialCompleta();
+
+    }
+
+
+    delay(
+      5
+    );
+
+  }
+
+
+  // ==========================================================
+  // SISTEMA LISTO
+  // ==========================================================
+
+  sistemaListo =
+    true;
+
+
+  posicionActualPasos = 0;
+
+  posicionObjetivoPasos = 0;
+
+  anguloObjetivo = 0;
+
+  movimientoEnCurso =
+    false;
+
+
+  modoInterfaz =
+    MODO_PRINCIPAL;
+
+
+  entradaUsuario = "";
+
+
+  mostrarDirecto(
+
+    "HOME COMPLETADO",
+
+    "POSICION: 0"
+
+  );
+
+
+  delay(
+    1200
+  );
+
+
+  forzarRedibujadoLCD();
+
+
+  activarMensajeTemporal(
+
+    "Sistema listo",
+
+    "D:ANG B:VEL",
+
+    900
+
+  );
+
+}
+
+
+// ============================================================
+// LOOP PRINCIPAL
+// ============================================================
+
+void loop() {
+
+  if (
+    !sistemaListo
+  ) {
+
+    return;
+
+  }
+
+
+  // Actualizar movimiento
+  actualizarMotorNoBloqueante();
+
+
+  // Leer teclado
+  char tecla =
+    teclado.getKey();
+
+
+  procesarTecla(
+    tecla
+  );
+
+
+  // Actualizar LCD
+  actualizarLCDOperacion();
+
+}
